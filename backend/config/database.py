@@ -1,20 +1,81 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import sessionmaker
+"""
+Database configuration for RepoShield backend.
+Uses SQLAlchemy 2.0 async engine with aiomysql driver.
+"""
 
-# Example configuration for MySQL
-# Replace user, password, host, and db_name with actual values
-SQLALCHEMY_DATABASE_URL = "mysql+pymysql://user:password@localhost:3306/db_name"
+from typing import AsyncGenerator
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# ---------------------------------------------------------------------------
+# Connection URL
+# Replace credentials and host before deploying.
+# ---------------------------------------------------------------------------
+DATABASE_URL: str = (
+    "mysql+aiomysql://user:password@localhost:3306/reposhield"
+)
 
-Base = declarative_base()
+# ---------------------------------------------------------------------------
+# Async Engine
+# pool_size=20      : base connections kept open at all times
+# max_overflow=10   : extra connections allowed beyond pool_size
+# pool_recycle=3600 : recycle connections after 1 hour to prevent stale
+#                     idle connections dropped by MySQL's wait_timeout —
+#                     especially important for long-running async AI loops
+# pool_pre_ping=True: issues a cheap "SELECT 1" before handing out a
+#                     connection so dropped idle connections are detected
+#                     and replaced automatically
+# ---------------------------------------------------------------------------
+engine: AsyncEngine = create_async_engine(
+    DATABASE_URL,
+    pool_size=20,
+    max_overflow=10,
+    pool_recycle=3600,
+    pool_pre_ping=True,
+    echo=False,
+)
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# ---------------------------------------------------------------------------
+# Session factory
+# expire_on_commit=False keeps ORM objects usable after commit without
+# triggering lazy-load errors in an async context.
+# ---------------------------------------------------------------------------
+AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+    autocommit=False,
+)
+
+
+# ---------------------------------------------------------------------------
+# Declarative Base – shared by all models
+# ---------------------------------------------------------------------------
+class Base(DeclarativeBase):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# FastAPI dependency
+# ---------------------------------------------------------------------------
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Yield an async database session and guarantee it is closed after the
+    request — even if an exception is raised mid-request.
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
