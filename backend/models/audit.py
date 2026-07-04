@@ -32,6 +32,8 @@ class PatchStatusEnum(str, enum.Enum):
     """Canonical lifecycle states for a vulnerability remediation job."""
     PENDING     = "PENDING"
     IN_PROGRESS = "IN_PROGRESS"
+    SANDBOXING  = "SANDBOXING"
+    VERIFIED    = "VERIFIED"
     PATCHED     = "PATCHED"
     FAILED      = "FAILED"
     SKIPPED     = "SKIPPED"

@@ -4,19 +4,28 @@ Authentication router — routers/auth.py
 POST /auth/register  — create a new user account
 POST /auth/login     — verify credentials, return signed JWT
 
+Rate limiting (Deficit 5 fix)
+---------
+The /login endpoint enforces a hard ceiling of 5 requests per minute per
+remote IP via slowapi + Limiter. This prevents credential stuffing and
+brute-force attacks. The limiter is wired into main.py's exception handler.
+
 Uses:
   - Passlib bcrypt (cost=12) for password hashing
   - PyJWT HS256 for access token signing
   - Async SQLAlchemy 2.0 for all DB operations
   - Pydantic V2 for strict request validation
+  - slowapi for in-process IP-based rate limiting
 """
 
-import uuid
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -25,6 +34,11 @@ from config.security import hash_password, verify_password, create_access_token
 from models.user import User
 
 logger = logging.getLogger("reposhield.auth")
+
+# ---------------------------------------------------------------------------
+# Rate limiter — keyed on remote client IP address
+# ---------------------------------------------------------------------------
+limiter = Limiter(key_func=get_remote_address)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -101,15 +115,18 @@ async def register(
     # 1. Email uniqueness check
     result = await db.execute(select(User).where(User.email == body.email))
     if result.scalar_one_or_none() is not None:
-        logger.warning(f"Register conflict: email already exists — {body.email}")
+        logger.warning(
+            "Registration conflict: email already exists",
+            extra={"email": body.email},
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"An account with email '{body.email}' already exists.",
         )
 
     # 2. Hash password + generate UUID
-    new_id:  str = str(uuid.uuid4())
-    hashed:  str = hash_password(body.password)
+    new_id: str = str(uuid.uuid4())
+    hashed: str = hash_password(body.password)
 
     # 3. Persist new User
     new_user = User(
@@ -124,10 +141,13 @@ async def register(
     try:
         await db.flush()
         await db.commit()
-        logger.info(f"User registered: id={new_id} email={body.email}")
+        logger.info("User registered", extra={"user_id": new_id, "email": body.email})
     except Exception as exc:
         await db.rollback()
-        logger.error(f"Failed to create user {body.email}: {exc}")
+        logger.error(
+            "Failed to create user account",
+            extra={"email": body.email, "error": str(exc)},
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Account creation failed. Please try again.",
@@ -141,7 +161,7 @@ async def register(
 
 
 # ---------------------------------------------------------------------------
-# POST /auth/login
+# POST /auth/login — Rate limited: 5 requests/minute per IP
 # ---------------------------------------------------------------------------
 
 @router.post(
@@ -149,26 +169,43 @@ async def register(
     response_model=LoginResponse,
     status_code=status.HTTP_200_OK,
     summary="Authenticate and obtain a JWT access token",
+    description=(
+        "Rate limited to **5 requests per minute per IP address**. "
+        "Returns HTTP 429 if the ceiling is breached."
+    ),
 )
+@limiter.limit("5/minute")
 async def login(
-    body: LoginRequest,
-    db:   Annotated[AsyncSession, Depends(get_db)],
+    request: Request,                               # required by slowapi
+    body:    LoginRequest,
+    db:      Annotated[AsyncSession, Depends(get_db)],
 ) -> LoginResponse:
-    # 1. Lookup by email — return generic 401 to prevent user enumeration
+    """
+    Validates credentials against the bcrypt-hashed password and issues a
+    signed HS256 JWT. Returns a generic 401 for both wrong email AND wrong
+    password to prevent user enumeration via timing differences.
+    """
+    # 1. Lookup by email
     result = await db.execute(select(User).where(User.email == body.email))
     user: User | None = result.scalar_one_or_none()
 
     if user is None:
-        logger.warning(f"Login: non-existent email attempted — {body.email}")
+        logger.warning(
+            "Login attempt for non-existent account",
+            extra={"email": body.email, "remote_ip": request.client.host if request.client else "unknown"},
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 2. Constant-time password verification
+    # 2. Constant-time bcrypt verification
     if not verify_password(body.password, user.hashed_password):
-        logger.warning(f"Login: wrong password for {body.email}")
+        logger.warning(
+            "Login failed: incorrect password",
+            extra={"user_id": user.id, "email": body.email},
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
@@ -182,9 +219,12 @@ async def login(
             detail="This account has been deactivated. Please contact support.",
         )
 
-    # 4. Issue JWT
+    # 4. Issue JWT access token
     token: str = create_access_token(user_id=user.id, email=user.email)
-    logger.info(f"Successful login: user_id={user.id}")
+    logger.info(
+        "Successful login",
+        extra={"user_id": user.id, "email": user.email},
+    )
 
     return LoginResponse(
         access_token=token,

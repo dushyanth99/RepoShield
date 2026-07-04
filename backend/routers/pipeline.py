@@ -94,35 +94,37 @@ async def _run_agent_in_background(
 ) -> None:
     """
     Executed by FastAPI BackgroundTasks after HTTP 202 is returned.
-    Opens its own AsyncSession via AsyncSessionLocal — completely isolated
-    from the already-closed request session.
-    """
-    logger.info(f"Background remediation started: job_id={job_id}")
 
-    top_finding = scan_result["findings"][0] if scan_result.get("findings") else {}
-    prompt = (
-        f"Static scan flagged '{file_path}' with "
-        f"{scan_result['total_findings']} finding(s). "
-        f"Top finding: category={top_finding.get('category', 'UNKNOWN')}, "
-        f"message={top_finding.get('message', 'No details')}. "
-        f"Rewrite the code to remediate all findings and make the test suite pass."
+    ShieldAgentOrchestrator is initialised with only a session_factory.
+    It opens all DB sessions internally and independently — zero shared
+    state with the already-closed request session.
+    """
+    logger.info(
+        "Background remediation task started",
+        extra={"job_id": job_id, "file_path": file_path},
     )
 
-    async with AsyncSessionLocal() as bg_session:
-        try:
-            orchestrator = ShieldAgentOrchestrator(
-                db_session=bg_session,
-                session_factory=AsyncSessionLocal,
-            )
-            result = await orchestrator.execute_remediation(
-                job_id=job_id,
-                prompt=prompt,
-                test_command=test_command,
-            )
-            logger.info(f"Remediation complete for job_id={job_id}: {result}")
-        except Exception as exc:
-            logger.error(f"Background remediation failed for job_id={job_id}: {exc}",
-                         exc_info=True)
+    orchestrator = ShieldAgentOrchestrator(db_session_factory=AsyncSessionLocal)
+
+    try:
+        result = await orchestrator.execute_remediation_pipeline(
+            job_id=job_id,
+            file_path=file_path,
+            raw_source_code=source_code,
+            test_command=test_command,
+        )
+        logger.info(
+            "Background remediation completed",
+            extra={"job_id": job_id, "result_preview": str(result)[:100]},
+        )
+    except Exception as exc:
+        # The orchestrator already wrote FAILED to the DB and logged the
+        # structured traceback. This outer catch prevents unhandled exceptions
+        # from silently disappearing inside FastAPI's background task runner.
+        logger.error(
+            "Background task caught re-raised orchestrator exception",
+            extra={"job_id": job_id, "error": str(exc)},
+        )
 
 
 # ---------------------------------------------------------------------------

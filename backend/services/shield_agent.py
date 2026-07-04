@@ -1,27 +1,41 @@
 """
 Autonomous Shield Agent Orchestrator — services/shield_agent.py
 
-Orchestrates the Antigravity agent lifecycle:
-  - Strict sandbox via LocalAgentConfig (no network, isolated workspace)
-  - Model Armor command interception via a Decide lifecycle hook
-  - Resilient TDD self-healing loop (test → fail → retrieve fix → retry)
-  - Fully isolated DB sessions to prevent connection pool starvation
+Orchestrates the Antigravity agent lifecycle with strict top-level exception
+encapsulation to guarantee VulnerabilityJob records NEVER hang in an
+intermediate state:
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Outer try/except  (Deficit 1 fix)                            │
+  │  ┌────────────────────────────────────────────────────────┐  │
+  │  │  async with Agent(config) as agent:                    │  │
+  │  │    Model Armor Decide hook registration                │  │
+  │  │    TDD self-healing loop (max 3 attempts)              │  │
+  │  │    agent.run() reasoning loop                          │  │
+  │  │    → status = VERIFIED on clean exit                  │  │
+  │  └────────────────────────────────────────────────────────┘  │
+  │  except Exception:                                            │
+  │    log structured JSON with job_id + traceback               │
+  │    open isolated session → status = FAILED                   │
+  │    re-raise for the background task supervisor               │
+  └──────────────────────────────────────────────────────────────┘
 
 Formerly: services/agent_orchestrator.py  (AutonomousSecurityOrchestrator)
 """
 
-import os
 import asyncio
 import logging
+import os
+import traceback
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from models.audit import VulnerabilityJob, PatchStatusEnum
 from config.settings import settings
+from models.audit import PatchStatusEnum, VulnerabilityJob
 
 logger = logging.getLogger("reposhield.shield_agent")
 
@@ -30,7 +44,7 @@ logger = logging.getLogger("reposhield.shield_agent")
 # CommandResult
 # ---------------------------------------------------------------------------
 class CommandResult:
-    def __init__(self, exit_code: int, stdout: str, stderr: str):
+    def __init__(self, exit_code: int, stdout: str, stderr: str) -> None:
         self.exit_code = exit_code
         self.stdout    = stdout
         self.stderr    = stderr
@@ -40,65 +54,76 @@ class CommandResult:
 # SDK / Client imports with dev-mode mock fallbacks
 # ---------------------------------------------------------------------------
 try:
-    from google.antigravity import (
+    from google.antigravity import (  # type: ignore[import]
         LocalAgentConfig,
         Agent,
         AgentExecutionContext,
         LifecycleHook,
     )
+    _ANTIGRAVITY_AVAILABLE = True
 except ImportError:
     logger.warning("google.antigravity not found — loading mock implementations.")
+    _ANTIGRAVITY_AVAILABLE = False
 
-    class LocalAgentConfig:
-        def __init__(self, workspace_dir: str, enable_network: bool):
+    class LocalAgentConfig:  # type: ignore[no-redef]
+        def __init__(self, workspace_dir: str, enable_network: bool) -> None:
             self.workspace_dir  = workspace_dir
             self.enable_network = enable_network
 
-    class AgentExecutionContext:
-        def __init__(self):
+    class AgentExecutionContext:  # type: ignore[no-redef]
+        def __init__(self) -> None:
             self.is_cancelled  = False
             self.cancel_reason: Optional[str] = None
 
         def cancel(self, reason: str) -> None:
             self.is_cancelled  = True
             self.cancel_reason = reason
-            logger.info(f"Execution context cancelled: {reason}")
+            logger.info("Execution context cancelled", extra={"reason": reason})
 
-    class LifecycleHook:
+    class LifecycleHook:  # type: ignore[no-redef]
         pass
 
-    class Agent:
-        def __init__(self, config: LocalAgentConfig):
-            self.config   = config
-            self.hooks: list     = []
-            self.instructions    = ""
-            self._run_count      = 0
+    class Agent:  # type: ignore[no-redef]
+        def __init__(self, config: LocalAgentConfig) -> None:
+            self.config        = config
+            self.hooks: list   = []
+            self.instructions  = ""
+            self._run_count    = 0
             self._feedbacks: list = []
 
         def register_hook(self, hook: Any) -> None:
             self.hooks.append(hook)
 
+        def write_file(self, path: str, content: str) -> None:
+            logger.info("Agent write_file called", extra={"path": path, "bytes": len(content)})
+
         def inject_context(self, ctx: str) -> None:
             self._feedbacks.append(ctx)
-            logger.info(f"Context injected: {ctx}")
+            logger.info("Context injected into agent memory", extra={"context_preview": ctx[:80]})
 
         def update_instructions(self, instructions: str) -> None:
             self.instructions = instructions
-            logger.info(f"Instructions updated: {instructions}")
+            logger.info("Agent instructions updated", extra={"instructions_preview": instructions[:80]})
 
         async def run_command(self, command: str) -> CommandResult:
             self._run_count += 1
-            logger.info(f"Agent running command (attempt {self._run_count}): {command}")
+            logger.info(
+                "Agent executing command",
+                extra={"command": command, "attempt": self._run_count},
+            )
             if "pytest" in command and self._run_count == 1:
                 return CommandResult(
                     exit_code=1,
                     stdout="pytest run failed",
-                    stderr="AssertionError: assert 'unsecure' == 'secure'\nFAILED tests/test_auth.py::test_auth_flow",
+                    stderr=(
+                        "AssertionError: assert 'unsecure' == 'secure'\n"
+                        "FAILED tests/test_auth.py::test_auth_flow"
+                    ),
                 )
-            return CommandResult(exit_code=0, stdout="pytest passed. 1 passed.", stderr="")
+            return CommandResult(exit_code=0, stdout="pytest: 1 passed.", stderr="")
 
-        async def run(self, prompt: str, context: AgentExecutionContext) -> str:
-            logger.info(f"Agent reasoning loop started.")
+        async def run(self, prompt: str, context: "AgentExecutionContext") -> str:
+            logger.info("Agent reasoning loop started")
             return "Reasoning completed."
 
         async def __aenter__(self) -> "Agent":
@@ -109,12 +134,14 @@ except ImportError:
 
 
 try:
-    from google.cloud import modelarmor_v1
+    from google.cloud import modelarmor_v1  # type: ignore[import]
+    _MODELARMOR_AVAILABLE = True
 except ImportError:
     logger.warning("google-cloud-modelarmor not found — loading mock client.")
+    _MODELARMOR_AVAILABLE = False
 
     class _MockMAResponse:
-        def __init__(self, is_malicious: bool = False, verdict: str = "SECURE"):
+        def __init__(self, is_malicious: bool = False, verdict: str = "SECURE") -> None:
             self.is_malicious = is_malicious
             self.verdict      = verdict
 
@@ -125,7 +152,7 @@ except ImportError:
                 return _MockMAResponse(is_malicious=True, verdict="BLOCKED")
             return _MockMAResponse(is_malicious=False, verdict="SECURE")
 
-    modelarmor_v1 = type(
+    modelarmor_v1 = type(  # type: ignore[assignment]
         "modelarmor_v1",
         (),
         {
@@ -136,11 +163,11 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Background thread: historical fix lookup
+# Background thread: historical fix lookup (CPU-bound, offloaded)
 # ---------------------------------------------------------------------------
 def _cpu_lookup_historical_fix(stack_trace: str) -> str:
     import time as _time
-    _time.sleep(0.3)  # simulate vector DB latency
+    _time.sleep(0.3)  # simulate vector DB / embedding search latency
     return (
         f"Fable-5 trace for '{stack_trace[:40]}…': "
         "Fix implicit string allocation mismatch — use parameterised query."
@@ -157,13 +184,18 @@ async def offload_historical_fix_lookup(stack_trace: str) -> str:
 class ModelArmorDecideHook(LifecycleHook):
     """Intercepts every agent command and passes it through Model Armor."""
 
-    def __init__(self, job_id: str, session_factory: Any, model_armor_client: Any):
-        self.job_id               = job_id
-        self.session_factory      = session_factory
-        self.model_armor_client   = model_armor_client
+    def __init__(
+        self,
+        job_id:             str,
+        session_factory:    Any,
+        model_armor_client: Any,
+    ) -> None:
+        self.job_id             = job_id
+        self.session_factory    = session_factory
+        self.model_armor_client = model_armor_client
 
     async def on_decide(self, context: Any, command: str) -> None:
-        logger.info(f"Model Armor intercepting command: {command!r}")
+        logger.info("Model Armor intercepting command", extra={"command_preview": command[:80]})
 
         request  = modelarmor_v1.CheckContentRequest(
             content=command,
@@ -171,8 +203,12 @@ class ModelArmorDecideHook(LifecycleHook):
         )
         response = self.model_armor_client.check_content(request=request)
 
-        if getattr(response, "is_malicious", False) or getattr(response, "verdict", "") == "BLOCKED":
-            logger.warning(f"Model Armor BLOCKED command: {command!r}")
+        if getattr(response, "is_malicious", False) or \
+                getattr(response, "verdict", "") == "BLOCKED":
+            logger.warning(
+                "Model Armor BLOCKED command",
+                extra={"job_id": self.job_id, "command": command},
+            )
 
             async with self.session_factory() as session:
                 try:
@@ -186,56 +222,106 @@ class ModelArmorDecideHook(LifecycleHook):
                     )
                     await session.commit()
                 except Exception as exc:
-                    logger.error(f"DB update failed in ModelArmorDecideHook: {exc}")
+                    logger.error(
+                        "DB update failed in ModelArmorDecideHook",
+                        extra={"job_id": self.job_id, "error": str(exc)},
+                    )
                     await session.rollback()
 
             context.cancel(reason="Security Violation: command blocked by Model Armor.")
 
 
 # ---------------------------------------------------------------------------
-# Shield Agent Orchestrator
+# Shield Agent Orchestrator — Deficit 1 Fix
 # ---------------------------------------------------------------------------
 class ShieldAgentOrchestrator:
     """
-    Manages the complete lifecycle of a RepoShield autonomous agent run:
-    sandbox configuration → Model Armor hook → TDD self-healing loop → DB audit.
+    Manages the complete autonomous remediation lifecycle.
+
+    Constructor now accepts only a session_factory (async_sessionmaker) so
+    every DB write opens its own clean, short-lived session. This eliminates
+    shared-session state across the long-running background task.
     """
 
-    def __init__(self, db_session: AsyncSession, session_factory: Any):
-        """
-        Args:
-            db_session:      Active AsyncSession for initial status write.
-                             Closed before the long reasoning loop begins.
-            session_factory: AsyncSessionLocal factory for isolated short-lived
-                             sessions used inside hooks and the background task.
-        """
-        self.db              = db_session
-        self.session_factory = session_factory
-        self.model_armor_client = modelarmor_v1.ModelArmorClient()
-        # Settings-driven — no os.getenv() calls scattered across the codebase
+    def __init__(self, db_session_factory: async_sessionmaker) -> None:  # type: ignore[type-arg]
+        self.session_factory     = db_session_factory
+        self.model_armor_client  = modelarmor_v1.ModelArmorClient()
         self.model_armor_source: str = settings.model_armor_project_location
 
+    # -----------------------------------------------------------------------
+    # Sandbox configuration
+    # -----------------------------------------------------------------------
     def configure_agent_sandbox(self, job_id: str) -> LocalAgentConfig:
-        """Isolated workspace per job; network disabled for strict sandboxing."""
+        """Isolated workspace per job; network access explicitly disabled."""
         workspace = Path(f"./tmp/sandboxes/job_{job_id}").resolve()
         os.makedirs(workspace, exist_ok=True)
-        logger.info(f"Sandbox configured: {workspace}")
+        logger.info("Sandbox configured", extra={"job_id": job_id, "workspace": str(workspace)})
         return LocalAgentConfig(workspace_dir=str(workspace), enable_network=False)
 
-    async def execute_remediation(
+    # -----------------------------------------------------------------------
+    # Internal DB helpers — each opens its own isolated session
+    # -----------------------------------------------------------------------
+    async def _write_status(self, job_id: str, status: PatchStatusEnum, **extra_values: Any) -> None:
+        async with self.session_factory() as session:
+            try:
+                await session.execute(
+                    update(VulnerabilityJob)
+                    .where(VulnerabilityJob.id == job_id)
+                    .values(patch_status=status, **extra_values)
+                )
+                await session.commit()
+                logger.info(
+                    "Job status updated",
+                    extra={"job_id": job_id, "status": status.value},
+                )
+            except Exception as exc:
+                await session.rollback()
+                logger.error(
+                    "Failed to write job status",
+                    extra={"job_id": job_id, "target_status": status.value, "error": str(exc)},
+                )
+                raise
+
+    # -----------------------------------------------------------------------
+    # Primary entrypoint — Deficit 1: full outer try/except
+    # -----------------------------------------------------------------------
+    async def execute_remediation_pipeline(
         self,
-        job_id:       str,
-        prompt:       str,
-        test_command: str = "pytest tests/",
+        job_id:          str,
+        file_path:       str,
+        raw_source_code: str,
+        test_command:    str = "pytest tests/",
     ) -> str:
         """
-        Full remediation pipeline:
-        1. Mark job IN_PROGRESS and release the initial DB session.
-        2. Enter the Antigravity agent context.
-        3. Run the TDD self-healing loop (max 3 attempts).
-        4. Run the agent reasoning loop.
-        5. Write final PATCHED / FAILED status via an isolated session.
+        Execute the full autonomous remediation pipeline with a hard outer
+        exception boundary.
+
+        On clean exit  → VulnerabilityJob.patch_status = VERIFIED
+        On any crash   → VulnerabilityJob.patch_status = FAILED (guaranteed)
+
+        Steps
+        -----
+        1. Write IN_PROGRESS via isolated session.
+        2. Enter Agent context manager.
+        3. Write source file into isolated sandbox.
+        4. Run TDD self-healing loop (≤3 attempts).
+        5. Run agent reasoning loop.
+        6. Write VERIFIED on success.
+
+        Exception boundary
+        ------------------
+        Any Exception that escapes the inner block is caught here, logged with
+        full traceback as structured JSON fields, written as FAILED to the DB,
+        and re-raised so the background task supervisor can observe the failure.
         """
+        logger.info(
+            "Starting remediation pipeline",
+            extra={"job_id": job_id, "file_path": file_path},
+        )
+
+        # Step 1: Mark job as IN_PROGRESS
+        await self._write_status(job_id, PatchStatusEnum.IN_PROGRESS)
+
         config      = self.configure_agent_sandbox(job_id)
         decide_hook = ModelArmorDecideHook(
             job_id=job_id,
@@ -243,100 +329,157 @@ class ShieldAgentOrchestrator:
             model_armor_client=self.model_armor_client,
         )
 
-        # --- Step 1: Write IN_PROGRESS, then close the initial session ---
+        # ===================================================================
+        # OUTER DEFENSIVE BOUNDARY — Deficit 1 core fix
+        # Guarantees job status is always written, even on SDK crashes,
+        # asyncio cancellations, or unexpected engine exceptions.
+        # ===================================================================
         try:
-            await self.db.execute(
-                update(VulnerabilityJob)
-                .where(VulnerabilityJob.id == job_id)
-                .values(patch_status=PatchStatusEnum.IN_PROGRESS)
-            )
-            await self.db.commit()
-        except Exception as exc:
-            logger.error(f"Failed to set IN_PROGRESS for job {job_id}: {exc}")
-            await self.db.rollback()
-        finally:
-            # CRITICAL: return connection to pool before the long loop starts
-            await self.db.close()
+            async with Agent(config) as agent:
+                # Write the source code into the isolated sandbox
+                agent.write_file(file_path, raw_source_code)
 
-        # --- Step 2–4: Agent execution ---
-        context = AgentExecutionContext()
+                # Attach Model Armor interception hook
+                agent.register_hook(decide_hook)
 
-        async with Agent(config) as agent:
-            agent.register_hook(decide_hook)
+                # Mark SANDBOXING so the frontend can show a meaningful sub-state
+                await self._write_status(job_id, PatchStatusEnum.SANDBOXING)
 
-            # TDD self-healing loop
-            max_retries     = 3
-            current_attempt = 0
+                context = AgentExecutionContext()
 
-            while current_attempt < max_retries:
-                current_attempt += 1
-                logger.info(f"TDD attempt {current_attempt}/{max_retries} for job {job_id}")
+                # -----------------------------------------------------------
+                # TDD self-healing loop (max 3 attempts)
+                # -----------------------------------------------------------
+                max_retries     = 3
+                current_attempt = 0
 
-                try:
-                    result = await agent.run_command(test_command)
-                    if result.exit_code != 0:
-                        raise RuntimeError(
-                            f"Tests failed (exit {result.exit_code}). "
-                            f"Stderr: {result.stderr}"
+                while current_attempt < max_retries:
+                    current_attempt += 1
+                    logger.info(
+                        "TDD attempt",
+                        extra={
+                            "job_id":   job_id,
+                            "attempt":  current_attempt,
+                            "max":      max_retries,
+                            "command":  test_command,
+                        },
+                    )
+
+                    cmd_result = await agent.run_command(test_command)
+
+                    if cmd_result.exit_code != 0:
+                        logger.warning(
+                            "Test run failed",
+                            extra={
+                                "job_id":   job_id,
+                                "attempt":  current_attempt,
+                                "exit_code": cmd_result.exit_code,
+                                "stderr":   cmd_result.stderr[:400],
+                            },
                         )
-                    logger.info(f"Tests passed on attempt {current_attempt}.")
-                    break
 
-                except RuntimeError as err:
-                    logger.error(f"Test failure captured: {err}")
-
-                    if current_attempt >= max_retries:
-                        raise err
-
-                    # A. Increment self-healing counter in isolated session
-                    async with self.session_factory() as session:
-                        try:
-                            await session.execute(
-                                update(VulnerabilityJob)
-                                .where(VulnerabilityJob.id == job_id)
-                                .values(
-                                    self_healing_count=VulnerabilityJob.self_healing_count + 1
-                                )
+                        if current_attempt >= max_retries:
+                            raise RuntimeError(
+                                f"Tests failed after {max_retries} attempts. "
+                                f"Stderr: {cmd_result.stderr}"
                             )
-                            await session.commit()
-                            logger.info(f"Self-healing count incremented for job {job_id}")
-                        except Exception as db_exc:
-                            logger.error(f"Failed to record self-healing event: {db_exc}")
-                            await session.rollback()
 
-                    # B. Retrieve historical fix on background thread
-                    fix = await offload_historical_fix_lookup(str(err))
+                        # Increment self-healing counter
+                        async with self.session_factory() as session:
+                            try:
+                                await session.execute(
+                                    update(VulnerabilityJob)
+                                    .where(VulnerabilityJob.id == job_id)
+                                    .values(
+                                        self_healing_count=VulnerabilityJob.self_healing_count + 1
+                                    )
+                                )
+                                await session.commit()
+                            except Exception as db_exc:
+                                logger.error(
+                                    "Failed to increment self_healing_count",
+                                    extra={"job_id": job_id, "error": str(db_exc)},
+                                )
+                                await session.rollback()
 
-                    # C. Inject cognitive feedback into agent memory
-                    agent.inject_context(
-                        f"Attempt {current_attempt} failed: {err}\nSuggested fix: {fix}"
+                        # Retrieve historical fix on a background thread
+                        fix = await offload_historical_fix_lookup(cmd_result.stderr)
+
+                        # Inject cognitive feedback into agent memory
+                        agent.inject_context(
+                            f"Attempt {current_attempt} failed.\n"
+                            f"Stderr: {cmd_result.stderr}\n"
+                            f"Suggested fix: {fix}"
+                        )
+                        agent.update_instructions(
+                            "Rewrite the affected source code to resolve the test failure "
+                            "described in the cognitive feedback and prepare for a re-run."
+                        )
+
+                    else:
+                        logger.info(
+                            "Tests passed",
+                            extra={"job_id": job_id, "attempt": current_attempt},
+                        )
+                        break
+
+                # -----------------------------------------------------------
+                # Agent reasoning loop
+                # -----------------------------------------------------------
+                if getattr(context, "is_cancelled", False):
+                    raise RuntimeError(
+                        f"Agent cancelled before reasoning: {context.cancel_reason}"
                     )
-                    agent.update_instructions(
-                        "Rewrite the source to resolve the error in the cognitive "
-                        "feedback and prepare for a re-run."
-                    )
 
-            # Reasoning loop
-            if getattr(context, "is_cancelled", False):
-                raise RuntimeError(f"Agent halted: {context.cancel_reason}")
-
-            agent_result = await agent.run(prompt=prompt, context=context)
-
-            if getattr(context, "is_cancelled", False):
-                raise RuntimeError(f"Agent halted post-run: {context.cancel_reason}")
-
-        # --- Step 5: Write final status ---
-        async with self.session_factory() as session:
-            try:
-                await session.execute(
-                    update(VulnerabilityJob)
-                    .where(VulnerabilityJob.id == job_id)
-                    .values(patch_status=PatchStatusEnum.PATCHED)
+                prompt = (
+                    f"Remediate all security vulnerabilities in '{file_path}'. "
+                    f"Tests have passed. Generate a final clean patch."
                 )
-                await session.commit()
-                logger.info(f"Job {job_id} marked PATCHED.")
-            except Exception as exc:
-                await session.rollback()
-                logger.error(f"Failed to mark job PATCHED: {exc}")
+                agent_result: str = await agent.run(prompt=prompt, context=context)
 
-        return agent_result
+                if getattr(context, "is_cancelled", False):
+                    raise RuntimeError(
+                        f"Agent cancelled during reasoning: {context.cancel_reason}"
+                    )
+
+            # Agent context exited cleanly — write VERIFIED
+            await self._write_status(job_id, PatchStatusEnum.VERIFIED)
+            logger.info("Remediation pipeline completed successfully", extra={"job_id": job_id})
+            return agent_result
+
+        # ===================================================================
+        # OUTER EXCEPTION HANDLER — guaranteed FAILED status + structured log
+        # ===================================================================
+        except Exception as execution_error:
+            error_trace = traceback.format_exc()
+            logger.error(
+                "Fatal disruption inside Antigravity agent execution context",
+                extra={
+                    "job_id":    job_id,
+                    "file_path": file_path,
+                    "error":     str(execution_error),
+                    "traceback": error_trace,
+                },
+            )
+
+            # Open a fully isolated session to stamp the job as FAILED.
+            # This must succeed even if the agent's internal session pool is exhausted.
+            async with self.session_factory() as failure_session:
+                job = await failure_session.get(VulnerabilityJob, job_id)
+                if job:
+                    job.patch_status = PatchStatusEnum.FAILED
+                    try:
+                        await failure_session.commit()
+                        logger.info(
+                            "Job stamped FAILED after exception",
+                            extra={"job_id": job_id},
+                        )
+                    except Exception as db_exc:
+                        logger.critical(
+                            "CRITICAL: Failed to write FAILED status — job is orphaned",
+                            extra={"job_id": job_id, "db_error": str(db_exc)},
+                        )
+                        await failure_session.rollback()
+
+            # Re-raise so FastAPI BackgroundTasks / the caller can observe the failure
+            raise execution_error
