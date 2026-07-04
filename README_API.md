@@ -10,6 +10,15 @@ When the backend server is running locally (e.g., via ngrok or on `localhost:800
 *   **Swagger Interactive Docs:** [https://unmendable-lala-complexly.ngrok-free.dev/docs](https://unmendable-lala-complexly.ngrok-free.dev/docs)
 *   **ReDoc Alternative View:** [https://unmendable-lala-complexly.ngrok-free.dev/redoc](https://unmendable-lala-complexly.ngrok-free.dev/redoc)
 
+> [!WARNING]
+> **ngrok Interstitial Warning Page Bypass**
+>
+> When accessing the public URL via a browser or an API client (like React `fetch`), ngrok displays a warning page ("*You are about to enter an ngrok tunnel...*") by default. This causes JSON parsers to crash with `SyntaxError: Unexpected token <`.
+> 
+> To bypass this warning:
+> 1. **Option A (Manual):** Visit [https://unmendable-lala-complexly.ngrok-free.dev/](https://unmendable-lala-complexly.ngrok-free.dev/) once in your browser and click the blue **"Visit Site"** button. This sets a cookie that allows all subsequent requests to go through.
+> 2. **Option B (Recommended for code):** Add the header `"ngrok-skip-browser-warning": "true"` to all API fetch requests. This skips the warning page entirely.
+
 ---
 
 ## 🔑 Authentication Endpoints
@@ -172,7 +181,8 @@ async function triggerVulnerabilityScan(filePath, code, testCommand, userId, jwt
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${jwtToken}`
+      "Authorization": `Bearer ${jwtToken}`,
+      "ngrok-skip-browser-warning": "true" // Bypass ngrok landing page warning
     },
     body: JSON.stringify({
       file_path: filePath,
@@ -201,7 +211,8 @@ function startPollingJob(jobId, jwtToken, onStateChange, onComplete, onError) {
       const response = await fetch(url, {
         method: "GET",
         headers: {
-          "Authorization": `Bearer ${jwtToken}`
+          "Authorization": `Bearer ${jwtToken}`,
+          "ngrok-skip-browser-warning": "true" // Bypass ngrok landing page warning
         }
       });
       
