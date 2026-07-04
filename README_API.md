@@ -7,8 +7,8 @@ This guide describes how the React frontend interacts with the FastAPI backend. 
 ## 🚀 Interactive API Documentation
 When the backend server is running locally (e.g., via ngrok or on `localhost:8000`), you can access real-time interactive documentation directly in your browser:
 
-*   **Swagger Interactive Docs:** [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) (Allows you to construct requests, fill in JSON objects, and trigger endpoints directly).
-*   **ReDoc Alternative View:** [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc) (Clean, structured list view of schemas and models).
+*   **Swagger Interactive Docs:** [https://unmendable-lala-complexly.ngrok-free.dev/docs](https://unmendable-lala-complexly.ngrok-free.dev/docs)
+*   **ReDoc Alternative View:** [https://unmendable-lala-complexly.ngrok-free.dev/redoc](https://unmendable-lala-complexly.ngrok-free.dev/redoc)
 
 ---
 
@@ -114,7 +114,7 @@ The server returns instantly with a `202 Accepted` status. The autonomous agent 
     "LOW": 0,
     "INFO": 0
   },
-  "message": "Scan job accepted. ShieldAgentOrchestrator is running in the background. Poll /api/v1/jobs/5fa7a1b8-c31a-4d22-b5cc-fb5a111a43ef for live status."
+  "message": "Scan job accepted. ShieldAgentOrchestrator is running in the background. Poll https://unmendable-lala-complexly.ngrok-free.dev/api/v1/jobs/5fa7a1b8-c31a-4d22-b5cc-fb5a111a43ef for live status."
 }
 ```
 
@@ -166,7 +166,7 @@ Here are quick copy-paste snippets you can drop into your services layer.
 ### 1. Trigger Scan Request
 ```javascript
 async function triggerVulnerabilityScan(filePath, code, testCommand, userId, jwtToken) {
-  const url = "http://127.0.0.1:8000/api/v1/jobs/scan";
+  const url = "https://unmendable-lala-complexly.ngrok-free.dev/api/v1/jobs/scan";
   
   const response = await fetch(url, {
     method: "POST",
@@ -194,7 +194,7 @@ async function triggerVulnerabilityScan(filePath, code, testCommand, userId, jwt
 ### 2. Polling Status Manager
 ```javascript
 function startPollingJob(jobId, jwtToken, onStateChange, onComplete, onError) {
-  const url = `http://127.0.0.1:8000/api/v1/jobs/${jobId}`;
+  const url = `https://unmendable-lala-complexly.ngrok-free.dev/api/v1/jobs/${jobId}`;
   
   const interval = setInterval(async () => {
     try {
