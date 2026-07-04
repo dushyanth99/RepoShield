@@ -1,15 +1,12 @@
 """
-RepoShield — FastAPI Application Entrypoint.
+RepoShield — FastAPI Application Entrypoint
+main.py
 
-Bootstraps the ASGI application, mounts middleware, registers all routing
-sub-modules, and fires a lifecycle startup handler that validates the async
-database connection pool.
+Bootstraps the ASGI application, mounts CORS middleware, registers routers,
+and fires a clean startup lifecycle banner.
 
-Run locally:
-    uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
-
-Expose over ngrok for hackathon demo:
-    ngrok http 8000
+Run locally (from the backend/ directory):
+    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
 from contextlib import asynccontextmanager
@@ -18,85 +15,54 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.config.database import engine
-from backend.routers import auth, pipeline
-from backend.routers.security import router as security_router
-
-# ---------------------------------------------------------------------------
-# ASCII Banner
-# ---------------------------------------------------------------------------
-BANNER: str = r"""
-╔══════════════════════════════════════════════════════════════╗
-║                                                              ║
-║    ██████╗ ███████╗██████╗  ██████╗ ███████╗██╗  ██╗        ║
-║    ██╔══██╗██╔════╝██╔══██╗██╔═══██╗██╔════╝██║  ██║        ║
-║    ██████╔╝█████╗  ██████╔╝██║   ██║███████╗███████║        ║
-║    ██╔══██╗██╔══╝  ██╔═══╝ ██║   ██║╚════██║██╔══██║        ║
-║    ██║  ██║███████╗██║     ╚██████╔╝███████║██║  ██║        ║
-║    ╚═╝  ╚═╝╚══════╝╚═╝      ╚═════╝ ╚══════╝╚═╝  ╚═╝        ║
-║                    ███████╗██╗  ██╗██╗███████╗██╗     ██████╗║
-║                    ██╔════╝██║  ██║██║██╔════╝██║     ██╔══██╗
-║                    ███████╗███████║██║█████╗  ██║     ██║  ██║
-║                    ╚════██║██╔══██║██║██╔══╝  ██║     ██║  ██║
-║                    ███████║██║  ██║██║███████╗███████╗██████╔╝
-║                    ╚══════╝╚═╝  ╚═╝╚═╝╚══════╝╚══════╝╚═════╝ ║
-║                                                              ║
-║   🛡  Autonomous Vulnerability Remediation Platform          ║
-║   ⚡  FastAPI  ·  SQLAlchemy 2.0  ·  Antigravity SDK         ║
-║   🔒  Secured by Google Cloud Model Armor                    ║
-╚══════════════════════════════════════════════════════════════╝
-"""
+from config.database import engine
+from routers.auth import router as auth_router
+from routers.pipeline import router as pipeline_router
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — startup / shutdown lifecycle handler
+# Lifespan — startup / shutdown
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     """
-    Manages application-level startup and graceful shutdown.
-
-    On startup:
-      - Prints the branded ASCII banner to the terminal.
-      - Fires a connectivity check against the async DB engine to confirm
-        the connection pool is live before accepting any traffic.
-        Uses pool_pre_ping so a recycled idle connection is never returned.
-
-    On shutdown:
-      - Disposes the async engine, draining all pooled connections cleanly.
+    Startup: validate the async DB connection pool is live.
+    Shutdown: drain all pooled connections gracefully.
     """
-    # --- Startup ---
-    print(BANNER)
-    print("  ► Initialising async database connection pool...")
+    import sqlalchemy
+
+    print("========================================")
+    print("🚀 RepoShield Core Engine Initialized")
+    print("========================================")
+    print("   Stack  : FastAPI · SQLAlchemy 2.0 · Antigravity SDK")
+    print("   Security: Google Cloud Model Armor")
+    print("========================================")
 
     try:
         async with engine.connect() as probe:
-            await probe.execute(__import__("sqlalchemy").text("SELECT 1"))
-        print("  ✓ Database connection pool is ACTIVE and healthy.\n")
+            await probe.execute(sqlalchemy.text("SELECT 1"))
+        print("✅ Database connection pool ACTIVE\n")
     except Exception as exc:
-        print(f"  ✗ Database connection failed on startup: {exc}\n")
-        print("  ⚠  Proceeding without a verified DB connection — check DATABASE_URL.\n")
+        print(f"⚠️  Database connection failed: {exc}")
+        print("   Proceeding without a verified DB pool — check DATABASE_URL.\n")
 
-    print("  ► All routers mounted. RepoShield API is ready to accept requests.\n")
+    yield  # application runs here
 
-    yield  # Application runs here
-
-    # --- Shutdown ---
-    print("\n  ► Shutting down — disposing async database engine...")
+    print("\n🔻 Shutting down — draining database connection pool...")
     await engine.dispose()
-    print("  ✓ Database connection pool drained. Goodbye.\n")
+    print("✅ Shutdown complete.\n")
 
 
 # ---------------------------------------------------------------------------
-# FastAPI Application Instance
+# Application instance
 # ---------------------------------------------------------------------------
-app: FastAPI = FastAPI(
-    title="RepoShield API",
+app = FastAPI(
+    title="RepoShield Core API",
+    version="1.0.0",
     description=(
-        "Autonomous vulnerability detection and self-healing pipeline "
+        "Autonomous vulnerability detection and self-healing remediation "
         "powered by Google Antigravity SDK and Model Armor."
     ),
-    version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -104,38 +70,33 @@ app: FastAPI = FastAPI(
 
 
 # ---------------------------------------------------------------------------
-# CORS Middleware
-# Permissive configuration required during hackathon presentation because the
-# React frontend is served over dynamic ngrok tunnels whose origins change on
-# every tunnel restart. Tighten allow_origins to an explicit list before
-# moving to a production environment.
+# CORS — permissive for hackathon / ngrok demo
+# Tighten allow_origins to an explicit list before production deployment.
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # Permit all origins (ngrok-safe for demo)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],       # Permit all HTTP methods
-    allow_headers=["*"],       # Permit all request headers
-    expose_headers=["*"],      # Expose all response headers to the browser
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
 # ---------------------------------------------------------------------------
-# Router Registration
+# Routers
 # ---------------------------------------------------------------------------
-app.include_router(auth.router)          # /auth/*      — user authentication
-app.include_router(pipeline.router)      # /pipeline/*  — scanning pipeline
-app.include_router(security_router)      # /security/*  — agent job results
+app.include_router(auth_router)      # /auth/*          — user authentication
+app.include_router(pipeline_router)  # /api/v1/jobs/*   — scanning pipeline
 
 
 # ---------------------------------------------------------------------------
 # Root health probe
 # ---------------------------------------------------------------------------
-@app.get("/", tags=["Health"], summary="Root health check")
+@app.get("/", tags=["Health"], summary="Root liveness check")
 async def root() -> dict[str, str]:
-    """Simple liveness probe. Returns API name and version."""
     return {
-        "service": "RepoShield API",
-        "version": "0.1.0",
-        "status": "operational",
+        "service": "RepoShield Core API",
+        "version": "1.0.0",
+        "status":  "operational",
     }

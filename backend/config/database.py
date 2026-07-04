@@ -1,6 +1,7 @@
 """
 Database configuration for RepoShield backend.
 Uses SQLAlchemy 2.0 async engine with aiomysql driver.
+DATABASE_URL is sourced from the validated Pydantic settings singleton.
 """
 
 from typing import AsyncGenerator
@@ -14,12 +15,13 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 # ---------------------------------------------------------------------------
-# Connection URL
-# Replace credentials and host before deploying.
+# Connection URL — sourced from validated Pydantic settings
+# Set DATABASE_URL in your .env file.
+# Example: mysql+aiomysql://user:password@localhost:3306/reposhield
 # ---------------------------------------------------------------------------
-DATABASE_URL: str = (
-    "mysql+aiomysql://user:password@localhost:3306/reposhield"
-)
+from config.settings import settings
+
+DATABASE_URL: str = settings.database_url
 
 # ---------------------------------------------------------------------------
 # Async Engine

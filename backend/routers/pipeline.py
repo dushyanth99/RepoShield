@@ -1,25 +1,17 @@
 """
 Core scanning pipeline router — routers/pipeline.py
 
-Exposes the primary endpoint the React frontend calls to trigger a
-vulnerability scan + autonomous remediation job:
-
-    POST /pipeline/scan  →  HTTP 202 Accepted  (immediate)
+POST /api/v1/jobs/scan   →  HTTP 202 Accepted  (immediate response)
+GET  /api/v1/jobs/{id}   →  live job status poll
 
 Execution flow
 --------------
-1. Receive the scan request payload (file path + raw source code).
-2. Run the StaticScannerInterface synchronously to flag vulnerability
-   categories and compute an initial business risk score.
-3. Open a request-scoped async DB session, create a new AuditLedger row
-   with status=PENDING, commit, then close the session.
-4. Enqueue the long-running AutonomousSecurityOrchestrator.execute_remediation
-   call as a FastAPI BackgroundTask — the endpoint returns HTTP 202 before
-   the Antigravity reasoning loop begins.
-5. The background task opens its own independent AsyncSession via the
-   session_factory so it is entirely isolated from the request session
-   that was already closed in step 3. This prevents connection pool
-   exhaustion regardless of how long the agent runs.
+1. Receive scan payload (file path + source code).
+2. Run StaticScannerInterface inline to classify vulnerabilities.
+3. Create VulnerabilityJob row (status=PENDING) in the request session, commit, close.
+4. Enqueue ShieldAgentOrchestrator.execute_remediation as a BackgroundTask.
+5. Return HTTP 202 immediately — frontend is never blocked.
+6. Background task opens its OWN isolated AsyncSession → zero session sharing.
 """
 
 import uuid
@@ -29,50 +21,36 @@ from typing import Annotated, Any, Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
-from backend.config.database import get_db, AsyncSessionLocal
-from backend.models.audit_ledger import AuditLedger, PatchStatus
-from backend.services.scanner import StaticScannerInterface
-from backend.services.agent_orchestrator import AutonomousSecurityOrchestrator
+from config.database import get_db, AsyncSessionLocal
+from models.audit import VulnerabilityJob, PatchStatusEnum
+from services.shield_agent import ShieldAgentOrchestrator
+from services.scanner import StaticScannerInterface
 
 logger = logging.getLogger("reposhield.pipeline")
 
-router = APIRouter(prefix="/pipeline", tags=["Scanning Pipeline"])
+router = APIRouter(prefix="/api/v1/jobs", tags=["Pipeline"])
 
-# Shared scanner instance — stateless, safe to reuse across requests
-_scanner = StaticScannerInterface()
+_scanner = StaticScannerInterface()   # stateless — safe to share across requests
 
 
 # ---------------------------------------------------------------------------
-# Pydantic Schemas
+# Pydantic schemas
 # ---------------------------------------------------------------------------
 
 class ScanRequest(BaseModel):
-    """
-    Payload the frontend sends to initiate a vulnerability scan + remediation job.
-    """
-    file_path: str = Field(
-        ...,
-        min_length=1,
-        max_length=1024,
-        description="Repository-relative path of the file to scan.",
-        examples=["app/auth.py"],
-    )
-    source_code: str = Field(
-        ...,
-        min_length=1,
-        description="Raw source code content of the file to analyse.",
-    )
-    test_command: str = Field(
-        default="pytest tests/",
-        description="Shell command to run the test suite inside the agent sandbox.",
-        examples=["pytest tests/test_auth.py -v"],
-    )
-    user_id: Optional[str] = Field(
-        default=None,
-        description="UUID of the requesting user. Used to link the AuditLedger record.",
-        examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"],
-    )
+    file_path:    str = Field(..., min_length=1, max_length=1024,
+                              description="Repository-relative path of the file to scan.",
+                              examples=["app/auth.py"])
+    source_code:  str = Field(..., min_length=1,
+                              description="Raw source code content of the file.")
+    test_command: str = Field(default="pytest tests/",
+                              description="Shell command to validate the patch inside the agent sandbox.",
+                              examples=["pytest tests/test_auth.py -v"])
+    user_id: Optional[str] = Field(default=None,
+                                   description="UUID of the requesting user.",
+                                   examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"])
 
     model_config = {"json_schema_extra": {"example": {
         "file_path":    "app/auth.py",
@@ -83,18 +61,24 @@ class ScanRequest(BaseModel):
 
 
 class ScanAcceptedResponse(BaseModel):
-    """
-    Immediate HTTP 202 response that unblocks the frontend while the
-    Antigravity agent reasoning loop runs in the background.
-    """
-    job_id:               str        = Field(..., description="UUID of the newly created scan job.")
-    status:               str        = Field(..., description="Current job status.")
-    file_path:            str        = Field(..., description="File path submitted for analysis.")
-    initial_findings:     int        = Field(..., description="Number of static-analysis findings detected before agent run.")
-    has_critical:         bool       = Field(..., description="True if at least one CRITICAL finding was detected.")
-    business_risk_score:  float      = Field(..., description="Initial risk score derived from static scan findings.")
-    scan_summary:         dict       = Field(..., description="Per-severity finding counts from the static scanner.")
-    message:              str        = Field(..., description="Human-readable status message for the frontend.")
+    job_id:              str   = Field(..., description="UUID of the newly created scan job.")
+    status:              str   = Field(..., description="Initial job status.")
+    file_path:           str   = Field(..., description="File submitted for analysis.")
+    initial_findings:    int   = Field(..., description="Static-analysis finding count.")
+    has_critical:        bool  = Field(..., description="True if ≥1 CRITICAL finding detected.")
+    business_risk_score: float = Field(..., description="Initial risk score from static scan.")
+    scan_summary:        dict  = Field(..., description="Per-severity finding counts.")
+    message:             str   = Field(..., description="Human-readable status for the frontend.")
+
+
+class JobStatusResponse(BaseModel):
+    job_id:              str
+    status:              str
+    file_path:           str
+    business_risk_score: float
+    model_armor_blocked: int
+    self_healing_count:  int
+    pull_request_url:    Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -109,34 +93,25 @@ async def _run_agent_in_background(
     scan_result:  dict[str, Any],
 ) -> None:
     """
-    Standalone coroutine executed by FastAPI BackgroundTasks.
-
-    Opens its own AsyncSession via AsyncSessionLocal (the factory) so it is
-    completely decoupled from the request-scoped session that was already
-    committed and closed before this task begins. This guarantees:
-      - No connection pool exhaustion (two live sessions never overlap).
-      - No 'session already closed' errors inside the orchestrator.
+    Executed by FastAPI BackgroundTasks after HTTP 202 is returned.
+    Opens its own AsyncSession via AsyncSessionLocal — completely isolated
+    from the already-closed request session.
     """
-    logger.info(f"Background remediation task started for job_id={job_id}")
+    logger.info(f"Background remediation started: job_id={job_id}")
 
-    # Build a concise prompt from the static scanner's top finding
-    top_finding: dict = {}
-    if scan_result.get("findings"):
-        top_finding = scan_result["findings"][0]
-
-    prompt: str = (
-        f"The static scanner flagged the file '{file_path}' with "
-        f"{scan_result['total_findings']} vulnerability finding(s). "
+    top_finding = scan_result["findings"][0] if scan_result.get("findings") else {}
+    prompt = (
+        f"Static scan flagged '{file_path}' with "
+        f"{scan_result['total_findings']} finding(s). "
         f"Top finding: category={top_finding.get('category', 'UNKNOWN')}, "
         f"message={top_finding.get('message', 'No details')}. "
-        f"Rewrite the affected code to remediate all findings and ensure tests pass."
+        f"Rewrite the code to remediate all findings and make the test suite pass."
     )
 
-    # Open an independent session for the entire background lifecycle
     async with AsyncSessionLocal() as bg_session:
         try:
-            orchestrator = AutonomousSecurityOrchestrator(
-                db=bg_session,
+            orchestrator = ShieldAgentOrchestrator(
+                db_session=bg_session,
                 session_factory=AsyncSessionLocal,
             )
             result = await orchestrator.execute_remediation(
@@ -144,19 +119,14 @@ async def _run_agent_in_background(
                 prompt=prompt,
                 test_command=test_command,
             )
-            logger.info(f"Remediation complete for job_id={job_id}. Result: {result}")
-
+            logger.info(f"Remediation complete for job_id={job_id}: {result}")
         except Exception as exc:
-            logger.error(
-                f"Background remediation failed for job_id={job_id}: {exc}",
-                exc_info=True,
-            )
-            # The orchestrator already handles final DB status writes internally;
-            # this outer catch is a safety net for unexpected failures.
+            logger.error(f"Background remediation failed for job_id={job_id}: {exc}",
+                         exc_info=True)
 
 
 # ---------------------------------------------------------------------------
-# Endpoint
+# POST /api/v1/jobs/scan
 # ---------------------------------------------------------------------------
 
 @router.post(
@@ -165,9 +135,9 @@ async def _run_agent_in_background(
     status_code=status.HTTP_202_ACCEPTED,
     summary="Trigger a vulnerability scan and autonomous remediation job",
     description=(
-        "Runs the static scanner immediately, creates an AuditLedger job record, "
-        "then enqueues the Antigravity agent remediation loop as a background task. "
-        "Returns HTTP 202 with the initial job state so the frontend is never blocked."
+        "Runs the static scanner immediately, creates a VulnerabilityJob record, "
+        "then enqueues the ShieldAgentOrchestrator as a background task. "
+        "Returns HTTP 202 with the initial job state — frontend never blocked."
     ),
 )
 async def trigger_scan(
@@ -175,38 +145,17 @@ async def trigger_scan(
     background_tasks: BackgroundTasks,
     db:               Annotated[AsyncSession, Depends(get_db)],
 ) -> ScanAcceptedResponse:
-    """
-    POST /pipeline/scan
-
-    Step-by-step
-    ------------
-    1. Run StaticScannerInterface.scan() to classify vulnerabilities and
-       derive an initial business risk score.
-    2. Create a new AuditLedger row (status=PENDING) in the request-scoped
-       session, commit, then allow get_db to close the session.
-    3. Register the Antigravity orchestrator as a BackgroundTask — it will
-       open its own isolated session via AsyncSessionLocal.
-    4. Return HTTP 202 immediately with the job ID and initial scan summary.
-    """
-
-    # -----------------------------------------------------------------
-    # 1. Static scan — CPU-light enough to run inline (< 5 000 lines)
-    # -----------------------------------------------------------------
+    # 1. Static scan
     scan_result: dict[str, Any] = await _scanner.scan(
         file_path=body.file_path,
         source_code=body.source_code,
     )
-
     logger.info(
-        f"Static scan complete for '{body.file_path}': "
-        f"{scan_result['total_findings']} findings "
-        f"(critical={scan_result['has_critical']})"
+        f"Static scan: '{body.file_path}' → "
+        f"{scan_result['total_findings']} findings (critical={scan_result['has_critical']})"
     )
 
-    # -----------------------------------------------------------------
-    # 2. Derive initial business risk score from severity distribution
-    #    CRITICAL=0.95, HIGH=0.75, MEDIUM=0.50, LOW=0.25, none=0.10
-    # -----------------------------------------------------------------
+    # 2. Derive initial risk score from severity distribution
     summary: dict = scan_result.get("summary", {})
     if summary.get("CRITICAL", 0) > 0:
         risk_score: float = 0.95
@@ -219,41 +168,33 @@ async def trigger_scan(
     else:
         risk_score = 0.10
 
-    # -----------------------------------------------------------------
-    # 3. Create AuditLedger record in the request-scoped session
-    # -----------------------------------------------------------------
+    # 3. Persist VulnerabilityJob (PENDING) in the request-scoped session
     job_id: str = str(uuid.uuid4())
-
-    ledger_row = AuditLedger(
+    job_row = VulnerabilityJob(
         id=job_id,
         user_id=body.user_id or "anonymous",
         target_file_path=body.file_path,
         business_risk_score=risk_score,
-        patch_status=PatchStatus.PENDING,
+        patch_status=PatchStatusEnum.PENDING,
         model_armor_blocked=0,
         self_healing_count=0,
         pull_request_url=None,
     )
-    db.add(ledger_row)
+    db.add(job_row)
 
     try:
         await db.flush()
         await db.commit()
-        logger.info(f"AuditLedger job created: job_id={job_id} status=PENDING")
+        logger.info(f"VulnerabilityJob created: job_id={job_id} status=PENDING")
     except Exception as exc:
         await db.rollback()
-        logger.error(f"Failed to persist AuditLedger row for job {job_id}: {exc}")
+        logger.error(f"Failed to create VulnerabilityJob {job_id}: {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create the scan job record. Please retry.",
         ) from exc
 
-    # -----------------------------------------------------------------
-    # 4. Enqueue agent orchestration as a background task.
-    #    The request-scoped `db` is committed and will be closed by
-    #    get_db's finally block. The background task receives its own
-    #    fresh session via AsyncSessionLocal — zero shared state.
-    # -----------------------------------------------------------------
+    # 4. Enqueue orchestrator — isolated session, opened inside _run_agent_in_background
     background_tasks.add_task(
         _run_agent_in_background,
         job_id=job_id,
@@ -262,67 +203,41 @@ async def trigger_scan(
         test_command=body.test_command,
         scan_result=scan_result,
     )
+    logger.info(f"Job {job_id} enqueued. Returning HTTP 202.")
 
-    logger.info(
-        f"Scan job {job_id} enqueued as background task. "
-        f"Returning HTTP 202 to client."
-    )
-
-    # -----------------------------------------------------------------
-    # 5. Return HTTP 202 immediately — frontend is never blocked
-    # -----------------------------------------------------------------
+    # 5. Return 202 immediately
     return ScanAcceptedResponse(
         job_id=job_id,
-        status=PatchStatus.PENDING.value,
+        status=PatchStatusEnum.PENDING.value,
         file_path=body.file_path,
         initial_findings=scan_result["total_findings"],
         has_critical=scan_result["has_critical"],
         business_risk_score=risk_score,
         scan_summary=summary,
         message=(
-            f"Scan job accepted. The Antigravity remediation agent is running "
-            f"in the background. Poll /pipeline/job/{job_id} for live status."
+            f"Scan job accepted. ShieldAgentOrchestrator is running in the background. "
+            f"Poll /api/v1/jobs/{job_id} for live status."
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Job status polling endpoint (used by frontend to track background progress)
+# GET /api/v1/jobs/{job_id}
 # ---------------------------------------------------------------------------
 
-class JobStatusResponse(BaseModel):
-    job_id:              str
-    status:              str
-    file_path:           str
-    business_risk_score: float
-    model_armor_blocked: int
-    self_healing_count:  int
-    pull_request_url:    Optional[str]
-
-
 @router.get(
-    "/job/{job_id}",
+    "/{job_id}",
     response_model=JobStatusResponse,
     status_code=status.HTTP_200_OK,
     summary="Poll the live status of a running scan job",
-    description="Returns the current AuditLedger record for the given job ID.",
 )
 async def get_job_status(
     job_id: str,
     db:     Annotated[AsyncSession, Depends(get_db)],
 ) -> JobStatusResponse:
-    """
-    GET /pipeline/job/{job_id}
-
-    Fetches the live AuditLedger row so the React frontend can poll for
-    status transitions (PENDING → IN_PROGRESS → PATCHED / FAILED).
-    """
-    from sqlalchemy import select
-    from backend.models.audit_ledger import AuditLedger
-
-    stmt = select(AuditLedger).where(AuditLedger.id == job_id)
+    stmt   = select(VulnerabilityJob).where(VulnerabilityJob.id == job_id)
     result = await db.execute(stmt)
-    row: AuditLedger | None = result.scalar_one_or_none()
+    row: VulnerabilityJob | None = result.scalar_one_or_none()
 
     if row is None:
         raise HTTPException(
