@@ -65,6 +65,12 @@ class User(Base):
         comment="Soft-disable flag; False blocks login without deleting data",
     )
 
+    hashed_password: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="bcrypt hash (cost=12) of the user's password. Never store plain-text.",
+    )
+
     github_token: Mapped[Optional[str]] = mapped_column(
         Text,
         nullable=True,
