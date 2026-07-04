@@ -23,7 +23,19 @@ From backend/ directory:
 
 import asyncio
 import logging
+import sys
+import os
 from logging.config import fileConfig
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Ensure the backend/ directory is on sys.path so that relative imports
+# like `from config.settings import settings` and `import models.audit`
+# resolve correctly regardless of which directory alembic is invoked from.
+# ---------------------------------------------------------------------------
+BACKEND_DIR = Path(__file__).resolve().parent.parent  # .../backend/
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
@@ -90,7 +102,7 @@ def run_migrations_offline() -> None:
 # -----------------------------------------------------------------------
 # Online mode: run migrations against a live async DB connection.
 # -----------------------------------------------------------------------
-def do_run_migrations(connection: Any) -> None:  # type: ignore[name-defined]
+def do_run_migrations(connection) -> None:
     """Synchronous inner function required by connection.run_sync()."""
     context.configure(
         connection=connection,

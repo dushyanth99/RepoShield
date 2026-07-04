@@ -48,31 +48,31 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("RepoShield Core Engine starting up")
 
     print("========================================")
-    print("🚀 RepoShield Core Engine Initialized")
+    print("[*] RepoShield Core Engine Initialized")
     print("========================================")
-    print("   Stack   : FastAPI · SQLAlchemy 2.0 · Antigravity SDK")
-    print("   Security : Google Cloud Model Armor · slowapi rate limiting")
+    print("   Stack   : FastAPI . SQLAlchemy 2.0 . Antigravity SDK")
+    print("   Security : Google Cloud Model Armor . slowapi rate limiting")
     print("   Logging  : Structured JSON (cloud-ready)")
     print("========================================")
 
     try:
         async with engine.connect() as probe:
             await probe.execute(sqlalchemy.text("SELECT 1"))
-        print("✅ Database connection pool ACTIVE\n")
+        print("[OK] Database connection pool ACTIVE\n")
         logger.info("Database connection pool probed successfully")
     except Exception as exc:
-        print(f"⚠️  Database connection failed: {exc}")
+        print(f"[WARN] Database connection failed: {exc}")
         logger.warning(
-            "Database probe failed — proceeding without verified pool",
+            "Database probe failed -- proceeding without verified pool",
             extra={"error": str(exc)},
         )
 
     yield  # ─── application serves requests here ───
 
-    logger.info("Shutting down — draining database connection pool")
-    print("\n🔻 Shutting down — draining database connection pool...")
+    logger.info("Shutting down -- draining database connection pool")
+    print("\n[>>] Shutting down -- draining database connection pool...")
     await engine.dispose()
-    print("✅ Shutdown complete.\n")
+    print("[OK] Shutdown complete.\n")
     logger.info("Engine disposed. Shutdown complete.")
 
 
