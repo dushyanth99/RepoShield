@@ -4,14 +4,28 @@ Static Scanner Interface — services/scanner.py
 Lightweight AST-based static analysis layer that parses Python source code
 into an Abstract Syntax Tree (AST) to identify vulnerabilities (e.g. hardcoded
 secrets, raw SQL string concatenations) and determine a baseline business impact float.
+
+Provides two scan surfaces:
+  1. scan(file_path, source_code)  — inline scan of a single file's raw source
+  2. scan_github_repo(repo_url)    — clone a public repo, walk all .py files,
+                                     return on first vulnerability found
 """
 
 import ast
+import asyncio
 import logging
+import os
+import shutil
+import tempfile
 from typing import Any, Optional
 from enum import Enum
 
 logger = logging.getLogger("reposhield.static_scanner")
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
 
 class Severity(str, Enum):
     CRITICAL = "CRITICAL"
@@ -30,6 +44,11 @@ class VulnerabilityCategory(str, Enum):
     WEAK_CRYPTOGRAPHY          = "WEAK_CRYPTOGRAPHY"
     OPEN_REDIRECT              = "OPEN_REDIRECT"
     DEBUG_EXPOSURE             = "DEBUG_EXPOSURE"
+
+
+# ---------------------------------------------------------------------------
+# AST Visitor — core detection engine
+# ---------------------------------------------------------------------------
 
 class ASTScanner(ast.NodeVisitor):
     """
@@ -154,13 +173,31 @@ class ASTScanner(ast.NodeVisitor):
             return node.s
         return None
 
+
+# ---------------------------------------------------------------------------
+# StaticScannerInterface — the public API consumed by pipeline and agents
+# ---------------------------------------------------------------------------
+
 class StaticScannerInterface:
     """
-    AST-based vulnerability scanner that parses Python source code.
-    Identifies flaws, calculates business impact, and returns structured findings.
+    AST-based vulnerability scanner.
+
+    Two scan surfaces:
+      • scan(file_path, source_code)   — parse a single raw source string
+      • scan_github_repo(repo_url)     — shallow-clone a public GitHub repo,
+                                          walk every .py file, return on the
+                                          first vulnerability detected
     """
+
+    # ── Timeout (seconds) for the git clone subprocess ─────────────────────
+    _CLONE_TIMEOUT_SECONDS: int = 60
+
     def __init__(self, rules: Optional[Any] = None) -> None:
         pass
+
+    # -----------------------------------------------------------------------
+    # Inline single-file scan (used by POST /api/v1/jobs/scan)
+    # -----------------------------------------------------------------------
 
     async def scan(self, file_path: str, source_code: str) -> dict[str, Any]:
         logger.info(f"StaticScannerInterface: AST scanning {file_path} ({len(source_code)} chars)")
@@ -232,3 +269,128 @@ class StaticScannerInterface:
             + " | ".join(f"{k}:{v}" for k, v in severity_summary.items() if v)
         )
         return result
+
+    # -----------------------------------------------------------------------
+    # Full-repo scan: clone → walk → AST-parse → return first vulnerability
+    # -----------------------------------------------------------------------
+
+    async def scan_github_repo(self, repo_url: str) -> dict[str, Any]:
+        """
+        Clone a public GitHub repository (shallow, depth=1) into a temporary
+        directory, walk every .py file through the AST scanner, and return
+        immediately on the first vulnerability detected.
+
+        Returns
+        -------
+        dict
+            On vulnerability:
+                {"status": "vulnerable", "file_path": str, "raw_code": str,
+                 "category": str, "business_impact": float}
+            On clean scan:
+                {"status": "secure"}
+        """
+        logger.info(f"scan_github_repo: starting shallow clone of {repo_url}")
+
+        tmp_dir: Optional[str] = None
+        try:
+            # -- 1. Create a temp directory for the clone ───────────────────
+            tmp_dir = tempfile.mkdtemp(prefix="reposhield_scan_")
+            logger.debug(f"Temporary clone directory: {tmp_dir}")
+
+            # -- 2. Shallow clone via asyncio subprocess ────────────────────
+            proc = await asyncio.create_subprocess_exec(
+                "git", "clone", "--depth", "1", repo_url, ".",
+                cwd=tmp_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=self._CLONE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.error(
+                    f"git clone timed out after {self._CLONE_TIMEOUT_SECONDS}s for {repo_url}"
+                )
+                return {"status": "error", "message": "git clone timed out"}
+
+            if proc.returncode != 0:
+                err_msg = stderr.decode(errors="replace").strip()
+                logger.error(f"git clone failed (rc={proc.returncode}): {err_msg}")
+                return {"status": "error", "message": f"git clone failed: {err_msg}"}
+
+            logger.info(f"Shallow clone complete for {repo_url}")
+
+            # -- 3. Walk .py files and AST-scan each ────────────────────────
+            for dirpath, _dirnames, filenames in os.walk(tmp_dir):
+                # Skip hidden directories (.git, .github, etc.)
+                rel_dir = os.path.relpath(dirpath, tmp_dir)
+                if any(part.startswith(".") for part in rel_dir.split(os.sep) if part != "."):
+                    continue
+
+                for filename in filenames:
+                    if not filename.endswith(".py"):
+                        continue
+
+                    abs_path = os.path.join(dirpath, filename)
+                    relative_path = os.path.relpath(abs_path, tmp_dir)
+
+                    try:
+                        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                            source_code = fh.read()
+                    except OSError as read_err:
+                        logger.warning(f"Could not read {relative_path}: {read_err}")
+                        continue
+
+                    # Skip empty files
+                    if not source_code.strip():
+                        continue
+
+                    # Parse the AST
+                    try:
+                        tree = ast.parse(source_code, filename=relative_path)
+                    except SyntaxError:
+                        logger.debug(f"SyntaxError in {relative_path} — skipping")
+                        continue
+
+                    scanner = ASTScanner(relative_path, source_code)
+                    scanner.visit(tree)
+
+                    if scanner.findings:
+                        first = scanner.findings[0]
+                        category_label = first["category"].value
+                        impact = first["business_impact_float"]
+
+                        logger.warning(
+                            f"Vulnerability detected in {relative_path}: "
+                            f"{category_label} (impact={impact})"
+                        )
+
+                        return {
+                            "status":          "vulnerable",
+                            "file_path":       relative_path,
+                            "raw_code":        source_code,
+                            "category":        category_label,
+                            "business_impact": impact,
+                        }
+
+            # -- 4. No vulnerabilities found ────────────────────────────────
+            logger.info(f"scan_github_repo: no vulnerabilities found in {repo_url}")
+            return {"status": "secure"}
+
+        except Exception as exc:
+            logger.error(f"scan_github_repo unexpected error: {exc}", exc_info=True)
+            return {"status": "error", "message": str(exc)}
+
+        finally:
+            # -- 5. Cleanup temp directory ──────────────────────────────────
+            if tmp_dir and os.path.isdir(tmp_dir):
+                try:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    logger.debug(f"Cleaned up temp directory: {tmp_dir}")
+                except Exception as cleanup_err:
+                    logger.warning(f"Failed to clean temp directory {tmp_dir}: {cleanup_err}")

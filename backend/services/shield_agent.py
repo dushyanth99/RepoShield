@@ -95,7 +95,7 @@ except ImportError:
             logger.info("Agent instructions updated", extra={"instructions_preview": instructions[:80]})
 
         async def chat(self, message: str) -> str:
-            logger.info("Agent chat called", extra={"message": message})
+            logger.info("Agent chat called", extra={"chat_message": message})
             self._feedbacks.append(message)
             
             # Simulate self-healing rewrite on retry
@@ -366,12 +366,38 @@ class ShieldAgentOrchestrator:
                                 logger.error(f"Failed to increment self healing count: {db_exc}")
                                 await session.rollback()
 
-                        # B. Intercept standard error and match historical Fable-5 fix
-                        import ml_engine
-                        trace_result = ml_engine.get_fable5_solution(result.stderr)
+                        # B. Intercept standard error and query real ML Engine for CWE and patch diff
+                        import httpx
+                        
+                        trace_result = "Fix and retry."
+                        try:
+                            async with httpx.AsyncClient() as client:
+                                # 1. Predict CWE
+                                pred_resp = await client.post(
+                                    "http://127.0.0.1:8001/predict",
+                                    json={"code": patched_code},
+                                    timeout=60.0
+                                )
+                                if pred_resp.status_code == 200:
+                                    pred_data = pred_resp.json()
+                                    cwe_id = pred_data.get("predicted_cwe") or "CWE-Unknown"
+                                    recommendation = pred_data.get("recommendations") or ""
+                                    
+                                    # 2. Generate Patch Diff
+                                    patch_resp = await client.post(
+                                        "http://127.0.0.1:8001/generate-patch",
+                                        json={"code": patched_code, "cwe_id": cwe_id, "language": "python"},
+                                        timeout=60.0
+                                    )
+                                    if patch_resp.status_code == 200:
+                                        patch_data = patch_resp.json()
+                                        diff = patch_data.get("diff", "")
+                                        trace_result = f"Predicted {cwe_id}: {recommendation}\nSuggested patch diff:\n{diff}"
+                        except Exception as ml_err:
+                            logger.error(f"Failed to reach ML Engine at 127.0.0.1:8001: {ml_err}")
 
                         # C. Inject the result back using agent.chat
-                        await agent.chat(f"Test failed. Trace context: {trace_result}. Fix and retry.")
+                        await agent.chat(f"Test failed with error:\n{result.stderr}\n\nML Engine context:\n{trace_result}")
 
                         if current_attempt >= max_retries:
                             raise RuntimeError(
@@ -396,7 +422,7 @@ class ShieldAgentOrchestrator:
                 logger.info("Creating remediation pull request...")
                 try:
                     pr_url = await git_mgr.create_remediation_pr(
-                        repo_name=repo_name,
+                        repo_url=f"https://github.com/{repo_name}",
                         file_path=file_path,
                         patched_code=patched_code,
                         base_branch="main",

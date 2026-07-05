@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+sqlalchemy
+slowapi
+passlib[bcrypt]
+PyJWT[cryptography]
+python-dotenv
+requests
+PyGithub
+httpx
+sse-starlette
+pydantic
+pydantic-settings
+alembic
+asyncpg
+greenlet
