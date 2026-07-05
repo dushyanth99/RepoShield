@@ -9,7 +9,10 @@ Renamed to align with the canonical architectural blueprint.
 """
 
 import enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from models.user import Repository
 
 from sqlalchemy import (
     CHAR,
@@ -131,8 +134,11 @@ class VulnerabilityJob(Base):
         comment="GitHub PR URL for the remediation patch; NULL until PR is created",
     )
 
-    # Relationship back to Repository (uncomment when Repository FK is active)
-    # repository = relationship("Repository", back_populates="vulnerability_jobs")
+    # Relationship back to Repository
+    repository: Mapped[Optional["Repository"]] = relationship(
+        "Repository",
+        back_populates="vulnerability_jobs",
+    )
 
     def __repr__(self) -> str:
         return (

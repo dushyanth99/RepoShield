@@ -13,9 +13,13 @@ Dependencies:
 import os
 import logging
 from datetime import datetime, timedelta, timezone
+import hmac
+import hashlib
 from typing import Any
 
 import jwt
+from fastapi import Request, Header, HTTPException, status, Depends
+from fastapi.security import OAuth2PasswordBearer
 from passlib.context import CryptContext
 
 logger = logging.getLogger("reposhield.security")
@@ -140,3 +144,54 @@ def decode_access_token(token: str) -> dict[str, Any]:
         key=_JWT_SECRET_KEY,
         algorithms=[_JWT_ALGORITHM],
     )
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
+    """
+    Dependency to decode JWT and return the authenticated user ID.
+    """
+    try:
+        payload = decode_access_token(token)
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user_id
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+# ---------------------------------------------------------------------------
+# Webhook Security
+# ---------------------------------------------------------------------------
+GITHUB_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "dummy_secret_for_local_dev")
+
+async def verify_github_webhook(
+    request: Request,
+    x_hub_signature_256: str = Header(None)
+):
+    """
+    Verify GitHub webhook requests using HMAC SHA-256 signatures.
+    """
+    if not x_hub_signature_256:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-Hub-Signature-256 header")
+        
+    payload = await request.body()
+    signature_hash = hmac.new(
+        GITHUB_WEBHOOK_SECRET.encode("utf-8"),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+    
+    expected_signature = f"sha256={signature_hash}"
+    
+    if not hmac.compare_digest(x_hub_signature_256, expected_signature):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid GitHub webhook signature")
+

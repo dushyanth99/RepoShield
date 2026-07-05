@@ -1,30 +1,39 @@
 """
 Core scanning pipeline router — routers/pipeline.py
 
-POST /api/v1/jobs/scan   →  HTTP 202 Accepted  (immediate response)
+POST /api/v1/jobs/scan   →  HTTP 200 (secure) or HTTP 202 Accepted (vulnerable)
 GET  /api/v1/jobs/{id}   →  live job status poll
 
 Execution flow
 --------------
-1. Receive scan payload (file path + source code).
-2. Run StaticScannerInterface inline to classify vulnerabilities.
-3. Create VulnerabilityJob row (status=PENDING) in the request session, commit, close.
-4. Enqueue ShieldAgentOrchestrator.execute_remediation as a BackgroundTask.
-5. Return HTTP 202 immediately — frontend is never blocked.
-6. Background task opens its OWN isolated AsyncSession → zero session sharing.
+1. Receive repo URL from the frontend.
+2. Run StaticScannerInterface.scan_github_repo to shallow-clone and AST-scan
+   every .py file for hardcoded secrets and injection vulnerabilities.
+3. If the repo is clean → return HTTP 200 immediately.
+4. If a vulnerability is found:
+   a. Create a VulnerabilityJob row (status=PENDING) and commit.
+   b. Enqueue ShieldAgentOrchestrator.execute_remediation as a BackgroundTask
+      with the dynamically discovered file_path and raw_code.
+   c. Return HTTP 202 Accepted — frontend is never blocked.
+5. Background task opens its OWN isolated AsyncSession → zero session sharing.
 """
 
 import uuid
 import logging
+import asyncio
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Request
+from sse_starlette.sse import EventSourceResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from config.database import get_db, AsyncSessionLocal
+from config.security import verify_github_webhook, get_current_user
 from models.audit import VulnerabilityJob, PatchStatusEnum
+from models.user import Repository
 from services.shield_agent import ShieldAgentOrchestrator
 from services.scanner import StaticScannerInterface
 
@@ -39,37 +48,26 @@ _scanner = StaticScannerInterface()   # stateless — safe to share across reque
 # Pydantic schemas
 # ---------------------------------------------------------------------------
 
-class ScanRequest(BaseModel):
-    file_path:    str = Field(..., min_length=1, max_length=1024,
-                              description="Repository-relative path of the file to scan.",
-                              examples=["app/auth.py"])
-    source_code:  str = Field(..., min_length=1,
-                              description="Raw source code content of the file.")
-    test_command: str = Field(default="pytest tests/",
-                              description="Shell command to validate the patch inside the agent sandbox.",
-                              examples=["pytest tests/test_auth.py -v"])
-    user_id: Optional[str] = Field(default=None,
-                                   description="UUID of the requesting user.",
-                                   examples=["f47ac10b-58cc-4372-a567-0e02b2c3d479"])
+class ManualScanRequest(BaseModel):
+    repository_id: str = Field(..., description="UUID of the repository to scan.")
+    test_command: str = Field(default="pytest tests/", description="Shell command to validate the patch.")
 
     model_config = {"json_schema_extra": {"example": {
-        "file_path":    "app/auth.py",
-        "source_code":  "query = 'SELECT * FROM users WHERE id = ' + user_id",
+        "repository_id": "b3f3b9c0-5f3a-4a2e-8a2a-7e3e9d3d3a2e",
         "test_command": "pytest tests/test_auth.py -v",
-        "user_id":      "f47ac10b-58cc-4372-a567-0e02b2c3d479",
     }}}
 
+class ScanSecureResponse(BaseModel):
+    status:  str = Field(..., description="Scan result status.")
+    message: str = Field(..., description="Human-readable summary.")
 
 class ScanAcceptedResponse(BaseModel):
     job_id:              str   = Field(..., description="UUID of the newly created scan job.")
     status:              str   = Field(..., description="Initial job status.")
-    file_path:           str   = Field(..., description="File submitted for analysis.")
-    initial_findings:    int   = Field(..., description="Static-analysis finding count.")
-    has_critical:        bool  = Field(..., description="True if ≥1 CRITICAL finding detected.")
-    business_risk_score: float = Field(..., description="Initial risk score from static scan.")
-    scan_summary:        dict  = Field(..., description="Per-severity finding counts.")
+    file_path:           str   = Field(..., description="Vulnerable file discovered by the scanner.")
+    category:            str   = Field(..., description="Vulnerability category (e.g. HARDCODED_SECRET).")
+    business_risk_score: float = Field(..., description="Business risk score from static scan.")
     message:             str   = Field(..., description="Human-readable status for the frontend.")
-
 
 class JobStatusResponse(BaseModel):
     job_id:              str
@@ -80,7 +78,6 @@ class JobStatusResponse(BaseModel):
     self_healing_count:  int
     pull_request_url:    Optional[str]
 
-
 # ---------------------------------------------------------------------------
 # Background task — fully isolated DB session
 # ---------------------------------------------------------------------------
@@ -90,15 +87,7 @@ async def _run_agent_in_background(
     file_path:    str,
     source_code:  str,
     test_command: str,
-    scan_result:  dict[str, Any],
 ) -> None:
-    """
-    Executed by FastAPI BackgroundTasks after HTTP 202 is returned.
-
-    ShieldAgentOrchestrator is initialised with only a session_factory.
-    It opens all DB sessions internally and independently — zero shared
-    state with the already-closed request session.
-    """
     logger.info(
         "Background remediation task started",
         extra={"job_id": job_id, "file_path": file_path},
@@ -118,109 +107,140 @@ async def _run_agent_in_background(
             extra={"job_id": job_id, "result_preview": str(result)[:100]},
         )
     except Exception as exc:
-        # The orchestrator already wrote FAILED to the DB and logged the
-        # structured traceback. This outer catch prevents unhandled exceptions
-        # from silently disappearing inside FastAPI's background task runner.
         logger.error(
             "Background task caught re-raised orchestrator exception",
             extra={"job_id": job_id, "error": str(exc)},
         )
 
-
 # ---------------------------------------------------------------------------
-# POST /api/v1/jobs/scan
+# POST /api/v1/jobs/scan/manual (Route A: Client-to-Server)
 # ---------------------------------------------------------------------------
-
 @router.post(
-    "/scan",
-    response_model=ScanAcceptedResponse,
+    "/scan/manual",
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Trigger a vulnerability scan and autonomous remediation job",
-    description=(
-        "Runs the static scanner immediately, creates a VulnerabilityJob record, "
-        "then enqueues the ShieldAgentOrchestrator as a background task. "
-        "Returns HTTP 202 with the initial job state — frontend never blocked."
-    ),
+    summary="Manually trigger a scan using a JWT",
 )
-async def trigger_scan(
-    body:             ScanRequest,
+async def trigger_scan_manual(
+    body:             ManualScanRequest,
     background_tasks: BackgroundTasks,
     db:               Annotated[AsyncSession, Depends(get_db)],
-) -> ScanAcceptedResponse:
-    # 1. Static scan
-    scan_result: dict[str, Any] = await _scanner.scan(
-        file_path=body.file_path,
-        source_code=body.source_code,
-    )
-    logger.info(
-        f"Static scan: '{body.file_path}' → "
-        f"{scan_result['total_findings']} findings (critical={scan_result['has_critical']})"
-    )
+    user_id:          str = Depends(get_current_user),
+):
+    repo = await db.get(Repository, body.repository_id)
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    if repo.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to scan this repository")
 
-    # 2. Derive initial risk score from severity distribution
-    summary: dict = scan_result.get("summary", {})
-    if summary.get("CRITICAL", 0) > 0:
-        risk_score: float = 0.95
-    elif summary.get("HIGH", 0) > 0:
-        risk_score = 0.75
-    elif summary.get("MEDIUM", 0) > 0:
-        risk_score = 0.50
-    elif summary.get("LOW", 0) > 0:
-        risk_score = 0.25
-    else:
-        risk_score = 0.10
+    scan_result = await _scanner.scan_github_repo(repo.github_repo_url)
 
-    # 3. Persist VulnerabilityJob (PENDING) in the request-scoped session
-    job_id: str = str(uuid.uuid4())
+    if scan_result.get("status") == "error":
+        raise HTTPException(status_code=422, detail=f"Scan failed: {scan_result.get('message')}")
+
+    if scan_result["status"] == "secure":
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=ScanSecureResponse(
+                status="secure",
+                message=f"No vulnerabilities detected in {repo.github_repo_url}.",
+            ).model_dump(),
+        )
+
+    file_path = scan_result["file_path"]
+    raw_code = scan_result["raw_code"]
+    category = scan_result["category"]
+    business_impact = scan_result["business_impact"]
+
+    job_id = str(uuid.uuid4())
     job_row = VulnerabilityJob(
         id=job_id,
-        user_id=body.user_id or "anonymous",
-        target_file_path=body.file_path,
-        business_risk_score=risk_score,
+        user_id=user_id,
+        repository_id=repo.id,
+        target_file_path=file_path,
+        business_risk_score=business_impact,
         patch_status=PatchStatusEnum.PENDING,
         model_armor_blocked=0,
         self_healing_count=0,
         pull_request_url=None,
     )
     db.add(job_row)
+    await db.commit()
 
-    try:
-        await db.flush()
-        await db.commit()
-        logger.info(f"VulnerabilityJob created: job_id={job_id} status=PENDING")
-    except Exception as exc:
-        await db.rollback()
-        logger.error(f"Failed to create VulnerabilityJob {job_id}: {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create the scan job record. Please retry.",
-        ) from exc
-
-    # 4. Enqueue orchestrator — isolated session, opened inside _run_agent_in_background
     background_tasks.add_task(
         _run_agent_in_background,
         job_id=job_id,
-        file_path=body.file_path,
-        source_code=body.source_code,
+        file_path=file_path,
+        source_code=raw_code,
         test_command=body.test_command,
-        scan_result=scan_result,
     )
-    logger.info(f"Job {job_id} enqueued. Returning HTTP 202.")
 
-    # 5. Return 202 immediately
     return ScanAcceptedResponse(
         job_id=job_id,
         status=PatchStatusEnum.PENDING.value,
-        file_path=body.file_path,
-        initial_findings=scan_result["total_findings"],
-        has_critical=scan_result["has_critical"],
-        business_risk_score=risk_score,
-        scan_summary=summary,
-        message=(
-            f"Scan job accepted. ShieldAgentOrchestrator is running in the background. "
-            f"Poll /api/v1/jobs/{job_id} for live status."
-        ),
+        file_path=file_path,
+        category=category,
+        business_risk_score=business_impact,
+        message=f"Vulnerability ({category}) detected. Remediation enqueued.",
     )
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/webhooks/github (Route B: Server-to-Server)
+# ---------------------------------------------------------------------------
+@router.post(
+    "/webhooks/github",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="GitHub Webhook ingress",
+)
+async def github_webhook(
+    request:          Request,
+    background_tasks: BackgroundTasks,
+    db:               Annotated[AsyncSession, Depends(get_db)],
+    _hmac:            None = Depends(verify_github_webhook),
+):
+    payload = await request.json()
+    repo_data = payload.get("repository", {})
+    repo_url = repo_data.get("html_url")
+
+    if not repo_url:
+        return JSONResponse(status_code=200, content={"message": "No repository URL in payload"})
+
+    result = await db.execute(select(Repository).where(Repository.github_repo_url == repo_url))
+    repo = result.scalars().first()
+    if not repo:
+        return JSONResponse(status_code=200, content={"message": "Repository not registered"})
+
+    scan_result = await _scanner.scan_github_repo(repo_url)
+
+    if scan_result.get("status") == "error":
+        raise HTTPException(status_code=422, detail="Scan failed")
+
+    if scan_result["status"] == "secure":
+        return JSONResponse(status_code=200, content={"message": "Clean"})
+
+    job_id = str(uuid.uuid4())
+    job_row = VulnerabilityJob(
+        id=job_id,
+        user_id=repo.user_id,
+        repository_id=repo.id,
+        target_file_path=scan_result["file_path"],
+        business_risk_score=scan_result["business_impact"],
+        patch_status=PatchStatusEnum.PENDING,
+        model_armor_blocked=0,
+        self_healing_count=0,
+        pull_request_url=None,
+    )
+    db.add(job_row)
+    await db.commit()
+
+    background_tasks.add_task(
+        _run_agent_in_background,
+        job_id=job_id,
+        file_path=scan_result["file_path"],
+        source_code=scan_result["raw_code"],
+        test_command="pytest tests/",
+    )
+
+    return JSONResponse(status_code=202, content={"message": "Accepted"})
 
 
 # ---------------------------------------------------------------------------
@@ -256,3 +276,43 @@ async def get_job_status(
         self_healing_count=row.self_healing_count,
         pull_request_url=row.pull_request_url,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/jobs/{job_id}/stream
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{job_id}/stream",
+    summary="Stream live job status updates via SSE",
+)
+async def stream_job_status(job_id: str):
+    async def event_generator():
+        while True:
+            async with AsyncSessionLocal() as session:
+                stmt = select(VulnerabilityJob).where(VulnerabilityJob.id == job_id)
+                result = await session.execute(stmt)
+                row = result.scalar_one_or_none()
+                
+                if row is None:
+                    yield {"event": "error", "data": '{"detail": "Job not found"}'}
+                    break
+                    
+                data = JobStatusResponse(
+                    job_id=row.id,
+                    status=row.patch_status.value,
+                    file_path=row.target_file_path,
+                    business_risk_score=row.business_risk_score,
+                    model_armor_blocked=row.model_armor_blocked,
+                    self_healing_count=row.self_healing_count,
+                    pull_request_url=row.pull_request_url,
+                ).model_dump_json()
+                
+                yield {"event": "message", "data": data}
+                
+                if row.patch_status.value in [PatchStatusEnum.VERIFIED.value, PatchStatusEnum.FAILED.value, PatchStatusEnum.MANUAL_REVIEW_REQUIRED.value]:
+                    break
+            
+            await asyncio.sleep(2)
+
+    return EventSourceResponse(event_generator())

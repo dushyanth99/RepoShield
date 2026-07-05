@@ -43,7 +43,7 @@ class GitHubAppManager:
         now: int = int(time.time())
         payload: dict = {
             "iss": self.app_id,
-            "iat": now - GWT_CLOCK_SKEW_SECONDS if 'GWT_CLOCK_SKEW_SECONDS' in globals() else now - JWT_CLOCK_SKEW_SECONDS,
+            "iat": now - JWT_CLOCK_SKEW_SECONDS,
             "exp": now + JWT_EXPIRY_SECONDS,
         }
         token: str = jwt.encode(payload, self.private_key_pem, algorithm=JWT_ALGORITHM)
@@ -75,7 +75,7 @@ class GitHubAppManager:
 
     async def create_remediation_pr(
         self,
-        repo_name: str,
+        repo_url: str,
         file_path: str,
         patched_code: str,
         base_branch: str = "main",
@@ -85,6 +85,9 @@ class GitHubAppManager:
         Creates a branch, commits the patched code, and opens a Pull Request on GitHub.
         Runs blocking PyGithub operations inside a thread pool using asyncio.to_thread.
         """
+        repo_name = repo_url.replace("https://github.com/", "").replace(".git", "")
+        if repo_name.endswith("/"):
+            repo_name = repo_name[:-1]
         if not installation_id:
             try:
                 # Auto-discover first available installation ID if not specified
