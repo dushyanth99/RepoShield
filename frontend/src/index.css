@@ -1,0 +1,43 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: #0a0f1c;
+    --foreground: #f8fafc;
+    --border: rgba(255, 255, 255, 0.1);
+  }
+
+  body {
+    @apply bg-navy-900 text-foreground font-sans antialiased;
+    background-color: var(--background);
+    color: var(--foreground);
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-heading tracking-tight;
+  }
+}
+
+/* Light Theme via CSS Filter Inversion (Hackathon approach for rapid theming on hardcoded dark UI) */
+body.light-theme {
+  filter: invert(1) hue-rotate(180deg);
+  background-color: #0a0f1c; /* Inverted background */
+}
+
+/* Re-invert SVGs, images, and specific elements so they look normal */
+body.light-theme img,
+body.light-theme svg {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+@layer components {
+  /* Glassmorphism utility for cards and sections */
+  .glass-card {
+    @apply bg-card backdrop-blur-xl border border-border rounded-2xl shadow-lg;
+    background-image: linear-gradient(to bottom right, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.01));
+  }
+}
