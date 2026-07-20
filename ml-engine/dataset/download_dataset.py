@@ -9,13 +9,12 @@ logger = logging.getLogger(__name__)
 
 def download_dataset():
     local_path = Path(LOCAL_DB_PATH)
-    logger.info("Checking local dataset...")
+    logger.info("Checking dataset...")
     if local_path.exists():
-        logger.info("Dataset found locally.")
+        logger.info("Dataset found")
         return
 
-    logger.info("Dataset not found.")
-    logger.info("Downloading dataset from Hugging Face...")
+    logger.info("Downloading dataset...")
     try:
         # Download the database to the specified local path parent folder
         hf_hub_download(

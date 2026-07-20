@@ -3,6 +3,7 @@ import pickle
 from pathlib import Path
 from transformers import AutoTokenizer
 from models.codebert_classifier import CodeBERTClassifier
+from models.download_model import check_model
 from config import MODEL_CHECKPOINT, SAVED_MODEL_DIR
 from utils.logging_utils import setup_logger
 from services.explainer import VulnerabilityExplainer
@@ -179,16 +180,19 @@ class VulnerabilityPredictor:
     
     def __init__(self, saved_model_dir: str = str(SAVED_MODEL_DIR)):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_path = Path(saved_model_dir) / "best_model"
+        self.model_path = check_model()
         
         # 1. Load Tokenizer & CodeBERT
-        if self.model_path.exists():
-            logger.info(f"Loading fine-tuned model and tokenizer from {self.model_path}...")
+        if (self.model_path / "config.json").exists():
+            logger.info("Loading tokenizer...")
             self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path))
+            logger.info("Loading fine-tuned CodeBERT...")
             self.model = CodeBERTClassifier.from_pretrained(str(self.model_path))
         else:
             logger.warning(f"No fine-tuned model found at {self.model_path}. Falling back to pre-trained base model {MODEL_CHECKPOINT}...")
+            logger.info("Loading tokenizer...")
             self.tokenizer = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT)
+            logger.info("Loading CodeBERT model...")
             self.model = CodeBERTClassifier(MODEL_CHECKPOINT)
             
         self.model.to(self.device)
@@ -199,7 +203,7 @@ class VulnerabilityPredictor:
         cwe_vec_path = Path(saved_model_dir) / "cwe_vectorizer.pkl"
         
         if cwe_clf_path.exists() and cwe_vec_path.exists():
-            logger.info("Loading trained CWE classifier...")
+            logger.info("Loading CWE classifier...")
             with open(cwe_clf_path, "rb") as f:
                 self.cwe_classifier = pickle.load(f)
             with open(cwe_vec_path, "rb") as f:

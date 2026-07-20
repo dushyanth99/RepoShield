@@ -9,3 +9,5 @@ dataset/CVEFixes.db
 .mypy_cache/
 .ruff_cache/
 logs/
+*.safetensors
+saved_models/best_model/model.safetensors

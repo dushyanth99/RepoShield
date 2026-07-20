@@ -54,42 +54,45 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Application Starts")
-    
-    # 1 & 2. Check Dataset and Download Dataset if Required
+    # 1. Check Dataset & Download Dataset if Missing
     from dataset.download_dataset import download_dataset
     try:
-        logger.info("Check Dataset...")
         download_dataset()
     except Exception as e:
         logger.error(f"Dataset Download Failure: {e}")
-        # Not raising, we can fail gracefully if needed, or raise depending on strictness.
+        
+    # 2. Check Model & Download Model if Missing
+    from models.download_model import check_model
+    try:
+        check_model()
+    except Exception as e:
+        logger.error(f"Model Download Failure: {e}")
+        raise RuntimeError(f"Startup failed: Could not obtain model from Hugging Face: {e}") from e
         
     # 3. Open SQLite
     from utils.db import init_db
     try:
-        logger.info("Open SQLite...")
+        logger.info("Opening SQLite...")
         init_db()
     except Exception as e:
         logger.error(f"SQLite Failure: {e}")
         
-    # 4. Load ML Models
+    # 4 & 5. Load Tokenizer, CodeBERT model, & CWE classifier
     try:
-        logger.info("Load ML Models...")
-        # Trigger the lazy loading
         get_predictor()
     except Exception as e:
         logger.error(f"Missing Model or Load Failure: {e}")
         
-    # 5. Initialize Services
+    # 6. Initialize Services
     try:
-        logger.info("Initialize Services...")
+        logger.info("Initializing services...")
         get_scanner()
         get_orchestrator()
     except Exception as e:
         logger.error(f"Service initialization error: {e}")
         
-    logger.info("FastAPI Starts")
+    # 7. Start FastAPI
+    logger.info("FastAPI ready.")
 
 
 # Global lazy-loaded predictors/scanners/orchestrators/services
