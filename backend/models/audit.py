@@ -131,8 +131,11 @@ class VulnerabilityJob(Base):
         comment="GitHub PR URL for the remediation patch; NULL until PR is created",
     )
 
-    # Relationship back to Repository (uncomment when Repository FK is active)
-    # repository = relationship("Repository", back_populates="vulnerability_jobs")
+    # Relationship back to Repository
+    repository: Mapped[Optional["Repository"]] = relationship(  # type: ignore[name-defined]
+        "Repository",
+        back_populates="vulnerability_jobs",
+    )
 
     def __repr__(self) -> str:
         return (

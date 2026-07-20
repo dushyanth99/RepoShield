@@ -1,0 +1,8 @@
+*.zip
+ngrok.exe
+ngrok.zip
+ngrok_latest/
+ngrok_v3*
+PUBLIC_URLS.txt
+*.log
+*.db

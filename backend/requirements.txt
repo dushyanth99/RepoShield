@@ -1,0 +1,16 @@
+# RepoShield Core API — runtime dependencies
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+sqlalchemy[asyncio]>=2.0.0
+aiomysql>=0.2.0
+aiosqlite>=0.19.0
+pydantic[email]>=2.0.0
+pydantic-settings>=2.0.0
+passlib[bcrypt]>=1.7.4
+bcrypt>=4.0.0,<5.0.0
+PyJWT[cryptography]>=2.8.0
+python-dotenv>=1.0.0
+slowapi>=0.1.9
+requests>=2.31.0
+PyGithub>=2.1.0
+alembic>=1.13.0
